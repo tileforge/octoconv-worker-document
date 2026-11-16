@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"go/parser"
 	"go/token"
 	"io"
@@ -426,6 +427,123 @@ func TestRenewFailuresStopAtExpiry(t *testing.T) {
 	mu.Unlock()
 	if got < 2 || flag.outcome() != "lease_lost" {
 		t.Fatalf("posts %d outcome %s", got, flag.outcome())
+	}
+}
+
+type blockConverter struct {
+	entered chan struct{}
+}
+
+func (blockConverter) Pairs() []convert.Pair { return nil }
+
+func (b blockConverter) Convert(ctx context.Context, _, _ string, _ map[string]any) error {
+	close(b.entered)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestHeartbeatSessionClosedStopsTheAttempt(t *testing.T) {
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("source"))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/heartbeat") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"session_closed"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	c.fileHTTP = c.coreHTTP
+	c.operation = convert.OperationConvert
+	c.engineLimit = time.Minute
+	c.sessionID = "sess"
+	c.sessionToken = "token"
+	c.leaseSeconds = 30
+	entered := make(chan struct{})
+	c.lookupOp = func(op, from, to string) (convert.Converter, bool) {
+		if op == convert.OperationConvert && from == "docx" && to == "pdf" {
+			return blockConverter{entered: entered}, true
+		}
+		return nil, false
+	}
+	later := time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	href := c.core.String() + "/objects/docx"
+	asgn := assignmentJSON{
+		AttemptID:       "attempt",
+		AttemptToken:    "attempt-token",
+		AttemptDeadline: later,
+		LeaseExpiresAt:  later,
+		Limits:          limitsJSON{MaxOutputBytes: convert.MaxFileBytes},
+		Inputs:          []fileLinkJSON{{Role: "source", Ordinal: 0, Href: href, Format: "docx"}},
+		Outputs:         []fileLinkJSON{{Role: "primary", Ordinal: 0, Href: href, Format: "pdf"}},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			return
+		}
+		_ = c.postHeartbeat(ctx, []byte(`{"protocol_version":1}`))
+	}()
+	err := c.runAssignment(ctx, asgn, controlJSON{})
+	if !errors.Is(err, errSessionClosed) {
+		t.Fatalf("assignment %v", err)
+	}
+	if !errors.Is(c.sessionFailure(), errSessionClosed) {
+		t.Fatal("session stayed open")
+	}
+}
+
+func TestHeartbeatLoopStopsAfterSessionClosed(t *testing.T) {
+	var mu sync.Mutex
+	heartbeats := 0
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		heartbeats++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"session_closed"}`))
+	}), nil)
+	c.sessionID = "sess"
+	c.sessionToken = "token"
+	c.beatEvery = 15 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c.heartbeatLoop(ctx)
+	mu.Lock()
+	got := heartbeats
+	mu.Unlock()
+	if got != 1 || !errors.Is(c.sessionFailure(), errSessionClosed) {
+		t.Fatalf("heartbeats %d session %v", got, c.sessionFailure())
+	}
+}
+
+func TestHeartbeatErrorLeavesTheAttemptRunning(t *testing.T) {
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}), nil)
+	c.sessionID = "sess"
+	c.sessionToken = "token"
+	attempt, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	var flag stopFlag
+	c.setActive(&liveAttempt{
+		asgn:   assignmentJSON{AttemptID: "attempt"},
+		parent: context.Background(),
+		cancel: cancel,
+		flag:   &flag,
+	})
+	if err := c.postHeartbeat(context.Background(), []byte(`{"protocol_version":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if c.sessionFailure() != nil || attempt.Err() != nil || flag.outcome() != "" {
+		t.Fatalf("session %v attempt %v outcome %s", c.sessionFailure(), attempt.Err(), flag.outcome())
 	}
 }
 

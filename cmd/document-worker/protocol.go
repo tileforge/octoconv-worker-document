@@ -170,10 +170,11 @@ type protocolClient struct {
 	pullWait     int
 	beatEvery    time.Duration
 
-	mu       sync.Mutex
-	active   *liveAttempt
-	draining bool
-	term     chan struct{}
+	mu         sync.Mutex
+	active     *liveAttempt
+	draining   bool
+	sessionErr error
+	term       chan struct{}
 }
 
 func newProtocolClient(dial protocolDial) (*protocolClient, error) {
@@ -284,6 +285,9 @@ func (c *protocolClient) loop(ctx context.Context) error {
 		return nil
 	}
 	for {
+		if err := c.sessionFailure(); err != nil {
+			return err
+		}
 		if ctx.Err() != nil || c.sessionTerminating() {
 			return nil
 		}
@@ -300,6 +304,9 @@ func (c *protocolClient) loop(ctx context.Context) error {
 		}()
 		pull, err := c.pull(pullCtx)
 		cancelPull()
+		if err := c.sessionFailure(); err != nil {
+			return err
+		}
 		if c.sessionTerminating() {
 			return nil
 		}
@@ -320,6 +327,9 @@ func (c *protocolClient) loop(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			case <-c.term:
+				if err := c.sessionFailure(); err != nil {
+					return err
+				}
 				return nil
 			case <-time.After(200 * time.Millisecond):
 			}
@@ -327,6 +337,9 @@ func (c *protocolClient) loop(ctx context.Context) error {
 		}
 		for _, asgn := range pull.Assignments {
 			if err := c.runAssignment(ctx, asgn, pull.Control); err != nil {
+				return err
+			}
+			if err := c.sessionFailure(); err != nil {
 				return err
 			}
 			if pull.Control.Terminate || c.sessionTerminating() {
@@ -358,13 +371,15 @@ func (c *protocolClient) heartbeatLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			c.postHeartbeat(ctx, body)
+			if errors.Is(c.postHeartbeat(ctx, body), errSessionClosed) {
+				return
+			}
 			timer.Reset(c.beatEvery)
 		}
 	}
 }
 
-func (c *protocolClient) postHeartbeat(ctx context.Context, body []byte) {
+func (c *protocolClient) postHeartbeat(ctx context.Context, body []byte) error {
 	raw, err := c.postCore(
 		ctx,
 		"/worker/v1/sessions/"+url.PathEscape(c.sessionID)+"/heartbeat",
@@ -374,16 +389,42 @@ func (c *protocolClient) postHeartbeat(ctx context.Context, body []byte) {
 		false,
 		terminalReportTimeout,
 	)
+	if errors.Is(err, errSessionClosed) {
+		c.noteSessionClosed()
+		return errSessionClosed
+	}
 	if err != nil {
-		return
+		return nil
 	}
 	var resp struct {
 		Control controlJSON `json:"control"`
 	}
 	if json.Unmarshal(raw, &resp) != nil {
-		return
+		return nil
 	}
 	c.applyHeartbeat(resp.Control)
+	return nil
+}
+
+func (c *protocolClient) noteSessionClosed() {
+	c.mu.Lock()
+	if c.sessionErr == nil {
+		c.sessionErr = errSessionClosed
+	}
+	run := c.active
+	c.mu.Unlock()
+	c.markTerminated()
+	if run == nil {
+		return
+	}
+	run.flag.claim("session_closed", errSessionClosed)
+	run.cancel(errSessionClosed)
+}
+
+func (c *protocolClient) sessionFailure() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessionErr
 }
 
 func (c *protocolClient) applyHeartbeat(ctrl controlJSON) {
