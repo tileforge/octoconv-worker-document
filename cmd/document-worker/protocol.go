@@ -812,6 +812,7 @@ func (c *protocolClient) renewLoop(parent, attempt context.Context, cancelAttemp
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
+	failures := 0
 	for {
 		select {
 		case <-parent.Done():
@@ -851,9 +852,11 @@ func (c *protocolClient) renewLoop(parent, attempt context.Context, cancelAttemp
 				return
 			}
 			if err != nil {
-				timer.Reset(cappedWait(leaseUntil, renewEvery(c.leaseSeconds)))
+				failures++
+				timer.Reset(renewRetryWait(leaseUntil, failures))
 				continue
 			}
+			failures = 0
 			if ctrl.Drain {
 				c.mu.Lock()
 				c.draining = true
@@ -878,6 +881,32 @@ func (c *protocolClient) renewLoop(parent, attempt context.Context, cancelAttemp
 			timer.Reset(cappedWait(leaseUntil, renewEvery(c.leaseSeconds)))
 		}
 	}
+}
+
+func renewRetryWait(leaseUntil time.Time, failures int) time.Duration {
+	backoff := time.Second
+	for n := 1; n < failures && backoff < 8*time.Second; n++ {
+		backoff *= 2
+	}
+	if leaseUntil.IsZero() {
+		return backoff
+	}
+	remaining := time.Until(leaseUntil)
+	if remaining <= 0 {
+		return 0
+	}
+	const slack = 20 * time.Millisecond
+	latest := remaining - slack
+	if latest < time.Millisecond {
+		latest = remaining / 2
+	}
+	if latest < time.Millisecond {
+		return 0
+	}
+	if backoff < latest {
+		return backoff
+	}
+	return latest
 }
 
 func cappedWait(leaseUntil time.Time, interval time.Duration) time.Duration {

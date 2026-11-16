@@ -293,6 +293,142 @@ func TestHelloRequestHasDeadline(t *testing.T) {
 	}
 }
 
+func TestRenewRetryWaitStaysInsideTheLease(t *testing.T) {
+	if got := renewRetryWait(time.Time{}, 1); got != time.Second {
+		t.Fatalf("first backoff %s", got)
+	}
+	if got := renewRetryWait(time.Time{}, 2); got != 2*time.Second {
+		t.Fatalf("second backoff %s", got)
+	}
+	if got := renewRetryWait(time.Time{}, 3); got != 4*time.Second {
+		t.Fatalf("third backoff %s", got)
+	}
+	if got := renewRetryWait(time.Time{}, 6); got != 8*time.Second {
+		t.Fatalf("capped backoff %s", got)
+	}
+	if got := renewRetryWait(time.Now().Add(-time.Second), 1); got != 0 {
+		t.Fatalf("expired lease %s", got)
+	}
+	until := time.Now().Add(15 * time.Second)
+	for failures := 1; failures <= 6; failures++ {
+		wait := renewRetryWait(until, failures)
+		if wait <= 0 || !time.Now().Add(wait).Before(until) {
+			t.Fatalf("failures %d wait %s until %s", failures, wait, until)
+		}
+	}
+	short := time.Now().Add(500 * time.Millisecond)
+	wait := renewRetryWait(short, 4)
+	if wait <= 0 || !time.Now().Add(wait).Before(short) {
+		t.Fatalf("short lease wait %s", wait)
+	}
+}
+
+func TestFailedRenewRetriesBeforeExpiry(t *testing.T) {
+	var mu sync.Mutex
+	posts := 0
+	leaseUntil := time.Now().Add(2 * time.Second)
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/lease") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		mu.Lock()
+		posts++
+		n := posts
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		raw, err := json.Marshal(map[string]string{
+			"lease_expires_at": time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	}), nil)
+	c.leaseSeconds = 0
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempt, cancelAttempt := context.WithCancelCause(parent)
+	defer cancelAttempt(context.Canceled)
+	var flag stopFlag
+	done := make(chan struct{})
+	go func() {
+		c.renewLoop(parent, attempt, cancelAttempt, &flag, assignmentJSON{AttemptID: "attempt", AttemptToken: "tok"}, leaseUntil, time.Now().Add(time.Hour))
+		close(done)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := posts
+		mu.Unlock()
+		if n >= 2 || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	got := posts
+	mu.Unlock()
+	if got < 2 || !time.Now().Before(leaseUntil) {
+		t.Fatalf("posts %d at %s before %s", got, time.Now(), leaseUntil)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renew loop")
+	}
+	if flag.outcome() == "lease_lost" {
+		t.Fatal("lease lost after a recovered renew")
+	}
+}
+
+func TestRenewFailuresStopAtExpiry(t *testing.T) {
+	var mu sync.Mutex
+	posts := 0
+	leaseUntil := time.Now().Add(600 * time.Millisecond)
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/lease") {
+			mu.Lock()
+			posts++
+			mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	c.leaseSeconds = 0
+	parent := context.Background()
+	attempt, cancelAttempt := context.WithCancelCause(parent)
+	defer cancelAttempt(context.Canceled)
+	var flag stopFlag
+	done := make(chan struct{})
+	go func() {
+		c.renewLoop(parent, attempt, cancelAttempt, &flag, assignmentJSON{AttemptID: "attempt", AttemptToken: "tok"}, leaseUntil, time.Now().Add(time.Hour))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("renew loop")
+	}
+	since := time.Since(leaseUntil)
+	if since < -50*time.Millisecond || since > 750*time.Millisecond {
+		t.Fatalf("stopped %s after expiry", since)
+	}
+	mu.Lock()
+	got := posts
+	mu.Unlock()
+	if got < 2 || flag.outcome() != "lease_lost" {
+		t.Fatalf("posts %d outcome %s", got, flag.outcome())
+	}
+}
+
 type fixedConverter struct {
 	body []byte
 }
