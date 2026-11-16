@@ -43,14 +43,45 @@ func TestProtocolDialReadsDocumentVariables(t *testing.T) {
 	t.Setenv("DOCUMENT_PROTOCOL_CLIENT_CA", ca)
 	t.Setenv("DOCUMENT_PROTOCOL_WORKER_ID", id.String())
 	t.Setenv("DOCUMENT_PROTOCOL_MANIFEST_PATH", manifest)
-	t.Setenv("DOCUMENT_WORKER_CONCURRENCY", "2")
+	t.Setenv("DOCUMENT_WORKER_CONCURRENCY", "")
 	t.Setenv("DOCUMENT_ENGINE_TIMEOUT", "90s")
 	dial, err := loadProtocolDial()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !dial.ready || dial.workerID != id || dial.freeSlots != 2 || dial.core.Host != "core.example" || dial.engineLimit != 90*time.Second {
+	if !dial.ready || dial.workerID != id || dial.freeSlots != 1 || dial.core.Host != "core.example" || dial.engineLimit != 90*time.Second {
 		t.Fatalf("dial %+v", dial)
+	}
+	t.Setenv("DOCUMENT_WORKER_CONCURRENCY", "1 # one slot")
+	dial, err = loadProtocolDial()
+	if err != nil || dial.freeSlots != 1 {
+		t.Fatalf("dial %+v %v", dial, err)
+	}
+}
+
+func TestProtocolDialRejectsExtraSlots(t *testing.T) {
+	dir := t.TempDir()
+	cert := filepath.Join(dir, "cert.pem")
+	key := filepath.Join(dir, "key.pem")
+	ca := filepath.Join(dir, "ca.pem")
+	manifest := filepath.Join(dir, "manifest.json")
+	for _, path := range []string{cert, key, ca, manifest} {
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id := uuid.New()
+	t.Setenv("DOCUMENT_PROTOCOL_CORE_URL", "https://core.example")
+	t.Setenv("DOCUMENT_PROTOCOL_CLIENT_CERT", cert)
+	t.Setenv("DOCUMENT_PROTOCOL_CLIENT_KEY", key)
+	t.Setenv("DOCUMENT_PROTOCOL_CLIENT_CA", ca)
+	t.Setenv("DOCUMENT_PROTOCOL_WORKER_ID", id.String())
+	t.Setenv("DOCUMENT_PROTOCOL_MANIFEST_PATH", manifest)
+	for _, value := range []string{"2", "0", "nope"} {
+		t.Setenv("DOCUMENT_WORKER_CONCURRENCY", value)
+		if _, err := loadProtocolDial(); err == nil {
+			t.Fatalf("accepted %q", value)
+		}
 	}
 }
 

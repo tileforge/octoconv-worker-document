@@ -35,13 +35,16 @@ func refuseLegacyStores() error {
 	return nil
 }
 
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(firstField(v)); err == nil {
-			return n
-		}
+func documentFreeSlots() (int, error) {
+	raw := os.Getenv("DOCUMENT_WORKER_CONCURRENCY")
+	if raw == "" {
+		return 1, nil
 	}
-	return def
+	n, err := strconv.Atoi(firstField(raw))
+	if err != nil || n != 1 {
+		return 0, errors.New("DOCUMENT_WORKER_CONCURRENCY must be 1")
+	}
+	return 1, nil
 }
 
 func envDuration(key string, def time.Duration) time.Duration {

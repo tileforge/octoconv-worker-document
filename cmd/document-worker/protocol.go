@@ -133,9 +133,9 @@ func loadProtocolDial() (protocolDial, error) {
 			return protocolDial{}, fmt.Errorf("%s must be a file", names[i])
 		}
 	}
-	slots := envInt("DOCUMENT_WORKER_CONCURRENCY", 1)
-	if slots < 1 {
-		slots = 1
+	slots, err := documentFreeSlots()
+	if err != nil {
+		return protocolDial{}, err
 	}
 	limit := envDuration("DOCUMENT_ENGINE_TIMEOUT", convert.DefaultEngineTimeout)
 	if limit <= 0 {

@@ -2,7 +2,7 @@
 
 Document worker for OctoConv. One process serves one approved manifest over Worker Protocol v1.
 
-The process reads `DOCUMENT_PROTOCOL_CORE_URL`, `DOCUMENT_PROTOCOL_CLIENT_CERT`, `DOCUMENT_PROTOCOL_CLIENT_KEY`, `DOCUMENT_PROTOCOL_CLIENT_CA`, `DOCUMENT_PROTOCOL_WORKER_ID`, and `DOCUMENT_PROTOCOL_MANIFEST_PATH`. It refuses to start when `DATABASE_URL` or `REDIS_ADDR` is set.
+The process reads `DOCUMENT_PROTOCOL_CORE_URL`, `DOCUMENT_PROTOCOL_CLIENT_CERT`, `DOCUMENT_PROTOCOL_CLIENT_KEY`, `DOCUMENT_PROTOCOL_CLIENT_CA`, `DOCUMENT_PROTOCOL_WORKER_ID`, and `DOCUMENT_PROTOCOL_MANIFEST_PATH`. It refuses to start when `DATABASE_URL` or `REDIS_ADDR` is set. `DOCUMENT_WORKER_CONCURRENCY` must be unset or `1`. Hello and pull advertise one slot, and one conversion runs at a time.
 
 `schema/manifest-document-convert.json` is capability `octoconv.convert.document`. It names the twelve LibreOffice pairs: docx, odt, xlsx, ods, pptx, and odp to pdf, plus docx↔odt, xlsx↔ods, and pptx↔odp.
 
