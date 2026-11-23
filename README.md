@@ -6,4 +6,4 @@ The process reads `DOCUMENT_PROTOCOL_CORE_URL`, `DOCUMENT_PROTOCOL_CLIENT_CERT`,
 
 `schema/manifest-document-convert.json` is capability `octoconv.convert.document`. It names the twelve LibreOffice pairs: docx, odt, xlsx, ods, pptx, and odp to pdf, plus docx↔odt, xlsx↔ods, and pptx↔odp.
 
-`soffice` must be on `PATH`. This process does not apply Landlock. The in-repo document worker does. Do not move document jobs onto this process until that confinement is measured.
+`soffice` must be on `PATH`. Render also needs `pdftoppm` on `PATH`. This process does not apply Landlock. The in-repo document worker does. Do not move document jobs onto this process until that confinement is measured.
