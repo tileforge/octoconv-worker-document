@@ -280,6 +280,56 @@ func TestDocumentRenderAssignment(t *testing.T) {
 			}
 		}
 	})
+	t.Run("Odt", func(t *testing.T) {
+		conv, ok := convert.Default.LookupOp(convert.OperationRender, "odt", "png")
+		if !ok {
+			t.Fatal("odt render missing")
+		}
+		if _, ok := conv.(convert.DocumentRenderConverter); !ok {
+			t.Fatalf("converter %T", conv)
+		}
+		src := odtBytes()
+		dir := t.TempDir()
+		in := filepath.Join(dir, "in.odt")
+		out := filepath.Join(dir, "out.png")
+		if err := os.WriteFile(in, src, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := conv.Convert(context.Background(), in, out, nil); err != nil {
+			t.Skip("render engines are not available")
+		}
+		want, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fails, puts := runRenderAssignment(t, src, "odt", "png")
+		if fails != 0 || len(puts) != 1 {
+			t.Fatalf("fails %d puts %d", fails, len(puts))
+		}
+		for _, put := range puts {
+			if !bytes.Equal(put.body, want) || put.contentType != "image/png" {
+				t.Fatalf("put %d %s", len(put.body), put.contentType)
+			}
+		}
+	})
+	t.Run("UndrawableSheet", func(t *testing.T) {
+		dir := t.TempDir()
+		in := filepath.Join(dir, "in.xlsx")
+		out := filepath.Join(dir, "out.png")
+		if err := os.WriteFile(in, []byte("not a workbook"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := (convert.DocumentRenderConverter{}).Convert(context.Background(), in, out, nil); err == nil {
+			t.Fatal("corrupt xlsx drawn")
+		}
+		if _, err := os.Stat(out); !os.IsNotExist(err) {
+			t.Fatal("png left")
+		}
+		fails, puts := runRenderAssignment(t, []byte("not a workbook"), "xlsx", "png")
+		if fails != 1 || len(puts) != 0 {
+			t.Fatalf("fails %d puts %d", fails, len(puts))
+		}
+	})
 	t.Run("AllBlank", func(t *testing.T) {
 		src := docxBytes("")
 		dir := t.TempDir()
@@ -356,6 +406,45 @@ func runRenderAssignment(t *testing.T, src []byte, from, to string) (int, map[st
 	mu.Lock()
 	defer mu.Unlock()
 	return fails, puts
+}
+
+func odtBytes() []byte {
+	content := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">` +
+		`<office:automatic-styles><style:style style:name="T1" style:family="text"><style:text-properties fo:font-size="72pt" fo:font-weight="bold" fo:color="#000000"/></style:style></office:automatic-styles>` +
+		`<office:body><office:text><text:p><text:span text:style-name="T1">X</text:span></text:p></office:text></office:body>` +
+		`</office:document-content>`
+	manifest := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3">` +
+		`<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>` +
+		`<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>` +
+		`</manifest:manifest>`
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	header := &zip.FileHeader{Name: "mimetype", Method: zip.Store}
+	w, err := zw.CreateHeader(header)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := w.Write([]byte("application/vnd.oasis.opendocument.text")); err != nil {
+		panic(err)
+	}
+	for name, contents := range map[string]string{
+		"content.xml":           content,
+		"META-INF/manifest.xml": manifest,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := w.Write([]byte(contents)); err != nil {
+			panic(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
 }
 
 func docxBytes(text string) []byte {

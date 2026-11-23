@@ -32,9 +32,14 @@ type DocumentRenderConverter struct{}
 // Operation reports the render operation.
 func (DocumentRenderConverter) Operation() string { return OperationRender }
 
-// Pairs returns the docx to png pair.
+// Pairs returns docx, odt, xlsx, ods, pptx, and odp to png, in that order.
 func (DocumentRenderConverter) Pairs() []Pair {
-	return []Pair{{From: "docx", To: "png"}}
+	sources := []string{"docx", "odt", "xlsx", "ods", "pptx", "odp"}
+	pairs := make([]Pair, len(sources))
+	for i, source := range sources {
+		pairs[i] = Pair{From: source, To: "png"}
+	}
+	return pairs
 }
 
 // Convert writes one square PNG at outPath.

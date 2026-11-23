@@ -4,10 +4,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -341,6 +343,341 @@ func zipDocx(body string) []byte {
 			panic(err)
 		}
 		if _, err := w.Write([]byte(contents)); err != nil {
+			panic(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+func TestDocumentRenderSources(t *testing.T) {
+	t.Run("Pairs", func(t *testing.T) {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "schema", "manifest-document-render.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc struct {
+			Capabilities []struct {
+				ID              string         `json:"id"`
+				ParameterSchema map[string]any `json:"parameter_schema"`
+				Formats         []Pair         `json:"formats"`
+			} `json:"capabilities"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		if len(doc.Capabilities) != 1 || doc.Capabilities[0].ID != "octoconv.render.document" {
+			t.Fatalf("capability %+v", doc.Capabilities)
+		}
+		if len(doc.Capabilities[0].ParameterSchema) != 0 || bytes.Contains(raw, []byte(`"page"`)) {
+			t.Fatal("page field")
+		}
+		want := []string{"docx", "odt", "xlsx", "ods", "pptx", "odp"}
+		pairs := (DocumentRenderConverter{}).Pairs()
+		if len(pairs) != len(want) || len(doc.Capabilities[0].Formats) != len(want) {
+			t.Fatalf("pairs %d formats %d", len(pairs), len(doc.Capabilities[0].Formats))
+		}
+		for i, source := range want {
+			pair := Pair{From: source, To: "png"}
+			if pairs[i] != pair || doc.Capabilities[0].Formats[i] != pair {
+				t.Fatalf("format %d got %+v %+v", i, pairs[i], doc.Capabilities[0].Formats[i])
+			}
+			conv, ok := Default.LookupOp(OperationRender, source, "png")
+			if !ok {
+				t.Fatalf("missing render %s", source)
+			}
+			if _, ok := conv.(DocumentRenderConverter); !ok {
+				t.Fatalf("converter %T", conv)
+			}
+			if _, ok := Default.LookupOp(OperationConvert, source, "png"); ok {
+				t.Fatalf("convert serves %s png", source)
+			}
+			if _, err := filterFor(source, "pdf"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, source := range []string{"pdf", "html"} {
+			if _, ok := Default.LookupOp(OperationRender, source, "png"); ok {
+				t.Fatalf("served %s", source)
+			}
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out.png")
+			if err := (DocumentRenderConverter{}).Convert(context.Background(), filepath.Join(dir, "in."+source), out, nil); err == nil {
+				t.Fatalf("drew %s", source)
+			}
+			if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+				t.Fatalf("png left for %s", source)
+			}
+		}
+	})
+
+	t.Run("Fixtures", func(t *testing.T) {
+		for _, source := range []string{"odt", "xlsx", "ods", "pptx", "odp"} {
+			assertZip(t, source, officeWithMark(source))
+		}
+		assertZip(t, "xlsx", xlsxLeadingBlank())
+		assertZip(t, "pptx", pptxLeadingBlank())
+	})
+
+	for _, source := range []string{"odt", "xlsx", "ods", "pptx", "odp"} {
+		t.Run(source, func(t *testing.T) {
+			requireRenderEngines(t)
+			img := decodePNG(t, renderOffice(t, source, officeWithMark(source), nil))
+			if img.Bounds().Dx() != 1280 || img.Bounds().Dy() != 1280 || !cornersWhite(img) || pageIsBlank(img) {
+				t.Fatalf("bounds %v blank %v", img.Bounds(), pageIsBlank(img))
+			}
+		})
+	}
+
+	t.Run("LeadingBlankSheet", func(t *testing.T) {
+		requireRenderEngines(t)
+		img := decodePNG(t, renderOffice(t, "xlsx", xlsxLeadingBlank(), nil))
+		if pageIsBlank(img) {
+			t.Fatal("leading blank sheet was not skipped")
+		}
+	})
+
+	t.Run("LeadingBlankSlide", func(t *testing.T) {
+		requireRenderEngines(t)
+		img := decodePNG(t, renderOffice(t, "pptx", pptxLeadingBlank(), nil))
+		if pageIsBlank(img) {
+			t.Fatal("leading blank slide was not skipped")
+		}
+	})
+}
+
+func renderOffice(t *testing.T, format string, body []byte, opts map[string]any) []byte {
+	t.Helper()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in."+format)
+	out := filepath.Join(dir, "out.png")
+	if err := os.WriteFile(in, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (DocumentRenderConverter{}).Convert(context.Background(), in, out, opts); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func assertZip(t *testing.T, source string, body []byte) {
+	t.Helper()
+	r, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(source, err)
+	}
+	if len(r.File) < 3 {
+		t.Fatalf("%s files %d", source, len(r.File))
+	}
+	switch source {
+	case "odt", "ods", "odp":
+		if r.File[0].Name != "mimetype" || r.File[0].Method != zip.Store {
+			t.Fatalf("%s mimetype %+v", source, r.File[0].FileHeader)
+		}
+	case "xlsx", "pptx":
+		if r.File[0].Name != "[Content_Types].xml" {
+			t.Fatalf("%s content types %s", source, r.File[0].Name)
+		}
+	}
+}
+
+func officeWithMark(source string) []byte {
+	switch source {
+	case "odt":
+		return odfPackage("application/vnd.oasis.opendocument.text", odtContent())
+	case "ods":
+		return odfPackage("application/vnd.oasis.opendocument.spreadsheet", odsContent())
+	case "odp":
+		return odfPackage("application/vnd.oasis.opendocument.presentation", odpContent())
+	case "xlsx":
+		return xlsxPackage(xlsxSheet("1", "X"), false)
+	case "pptx":
+		return pptxPackage([]string{pptxShape()})
+	default:
+		panic(source)
+	}
+}
+
+func odfPackage(media, content string) []byte {
+	manifest := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3">` +
+		`<manifest:file-entry manifest:full-path="/" manifest:media-type="` + media + `"/>` +
+		`<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>` +
+		`</manifest:manifest>`
+	return zipParts([]zipPart{
+		{name: "mimetype", body: media, store: true},
+		{name: "content.xml", body: content},
+		{name: "META-INF/manifest.xml", body: manifest},
+	})
+}
+
+func odtContent() string {
+	return `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">` +
+		`<office:automatic-styles><style:style style:name="T1" style:family="text"><style:text-properties fo:font-size="72pt" fo:font-weight="bold" fo:color="#000000"/></style:style></office:automatic-styles>` +
+		`<office:body><office:text><text:p><text:span text:style-name="T1">X</text:span></text:p></office:text></office:body>` +
+		`</office:document-content>`
+}
+
+func odsContent() string {
+	return `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" office:version="1.3">` +
+		`<office:automatic-styles><style:style style:name="C1" style:family="table-cell"><style:text-properties fo:font-size="72pt" fo:font-weight="bold" fo:color="#000000"/></style:style></office:automatic-styles>` +
+		`<office:body><office:spreadsheet><table:table table:name="Sheet1"><table:table-row><table:table-cell office:value-type="string" table:style-name="C1"><text:p>X</text:p></table:table-cell></table:table-row></table:table></office:spreadsheet></office:body>` +
+		`</office:document-content>`
+}
+
+func odpContent() string {
+	return `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0" office:version="1.3">` +
+		`<office:automatic-styles><style:style style:name="G1" style:family="graphic"><style:graphic-properties draw:fill="solid" draw:fill-color="#000000"/></style:style></office:automatic-styles>` +
+		`<office:body><office:presentation><draw:page draw:name="Slide1"><draw:rect draw:style-name="G1" svg:x="4cm" svg:y="4cm" svg:width="10cm" svg:height="8cm"/></draw:page></office:presentation></office:body>` +
+		`</office:document-content>`
+}
+
+func xlsxLeadingBlank() []byte {
+	sheet := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+		`<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>` +
+		`<sheetData>` +
+		`<row r="1" ht="90" customHeight="1"><c r="A1" s="2" t="inlineStr"><is><t>X</t></is></c></row>` +
+		`<row r="2" ht="90" customHeight="1"><c r="A2" s="1" t="inlineStr"><is><t>X</t></is></c></row>` +
+		`</sheetData>` +
+		`<rowBreaks count="1" manualBreakCount="1"><brk id="1" max="16383" man="1"/></rowBreaks>` +
+		`</worksheet>`
+	return xlsxPackage(sheet, true)
+}
+
+func xlsxSheet(style, text string) string {
+	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+		`<sheetViews><sheetView showGridLines="0" workbookViewId="0"/></sheetViews>` +
+		`<sheetData><row r="1" ht="90" customHeight="1"><c r="A1" s="` + style + `" t="inlineStr"><is><t>` + text + `</t></is></c></row></sheetData>` +
+		`</worksheet>`
+}
+
+func xlsxPackage(sheet string, whiteFont bool) []byte {
+	fonts := `<font><sz val="11"/><name val="Calibri"/></font><font><sz val="72"/><color rgb="FF000000"/><name val="Calibri"/><b/></font>`
+	xfs := `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+		`<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>`
+	fontCount, xfCount := "2", "2"
+	if whiteFont {
+		fonts += `<font><sz val="72"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>`
+		xfs += `<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>`
+		fontCount, xfCount = "3", "3"
+	}
+	styles := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+		`<fonts count="` + fontCount + `">` + fonts + `</fonts>` +
+		`<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>` +
+		`<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>` +
+		`<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+		`<cellXfs count="` + xfCount + `">` + xfs + `</cellXfs>` +
+		`</styleSheet>`
+	contentTypes := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+		`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+		`<Default Extension="xml" ContentType="application/xml"/>` +
+		`<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+		`<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>` +
+		`<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>` +
+		`</Types>`
+	return zipParts([]zipPart{
+		{name: "[Content_Types].xml", body: contentTypes},
+		{name: "_rels/.rels", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`},
+		{name: "xl/workbook.xml", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>`},
+		{name: "xl/_rels/workbook.xml.rels", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`},
+		{name: "xl/worksheets/sheet1.xml", body: sheet},
+		{name: "xl/styles.xml", body: styles},
+	})
+}
+
+func pptxLeadingBlank() []byte {
+	return pptxPackage([]string{"", pptxShape()})
+}
+
+func pptxShape() string {
+	return `<p:sp><p:nvSpPr><p:cNvPr id="2" name="Mark"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="914400" y="914400"/><a:ext cx="5486400" cy="3657600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="000000"/></a:solidFill></p:spPr></p:sp>`
+}
+
+func pptxPackage(shapes []string) []byte {
+	var contentTypes strings.Builder
+	contentTypes.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	contentTypes.WriteString(`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">`)
+	contentTypes.WriteString(`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>`)
+	contentTypes.WriteString(`<Default Extension="xml" ContentType="application/xml"/>`)
+	contentTypes.WriteString(`<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>`)
+	var slideIDs, slideRels strings.Builder
+	parts := []zipPart{{name: "[Content_Types].xml", body: ""}}
+	for i, shape := range shapes {
+		n := i + 1
+		contentTypes.WriteString(fmt.Sprintf(`<Override PartName="/ppt/slides/slide%d.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`, n))
+		slideIDs.WriteString(fmt.Sprintf(`<p:sldId id="%d" r:id="rId%d"/>`, 255+n, n))
+		slideRels.WriteString(fmt.Sprintf(`<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide%d.xml"/>`, n, n))
+		parts = append(parts, zipPart{
+			name: fmt.Sprintf("ppt/slides/slide%d.xml", n),
+			body: pptxSlide(shape),
+		})
+		parts = append(parts, zipPart{
+			name: fmt.Sprintf("ppt/slides/_rels/slide%d.xml.rels", n),
+			body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`,
+		})
+	}
+	contentTypes.WriteString(`</Types>`)
+	parts[0].body = contentTypes.String()
+	presentation := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
+		`<p:sldIdLst>` + slideIDs.String() + `</p:sldIdLst>` +
+		`<p:sldSz cx="9144000" cy="6858000" type="screen4x3"/>` +
+		`<p:notesSz cx="6858000" cy="9144000"/>` +
+		`</p:presentation>`
+	parts = append(parts,
+		zipPart{name: "_rels/.rels", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>`},
+		zipPart{name: "ppt/presentation.xml", body: presentation},
+		zipPart{name: "ppt/_rels/presentation.xml.rels", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` + slideRels.String() + `</Relationships>`},
+	)
+	return zipParts(parts)
+}
+
+func pptxSlide(shape string) string {
+	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">` +
+		`<p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:effectLst/></p:bgPr></p:bg>` +
+		`<p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>` +
+		`<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>` +
+		shape +
+		`</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`
+}
+
+type zipPart struct {
+	name  string
+	body  string
+	store bool
+}
+
+func zipParts(parts []zipPart) []byte {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, part := range parts {
+		var (
+			w   io.Writer
+			err error
+		)
+		if part.store {
+			w, err = zw.CreateHeader(&zip.FileHeader{Name: part.name, Method: zip.Store})
+		} else {
+			w, err = zw.Create(part.name)
+		}
+		if err != nil {
+			panic(err)
+		}
+		if _, err := w.Write([]byte(part.body)); err != nil {
 			panic(err)
 		}
 	}
