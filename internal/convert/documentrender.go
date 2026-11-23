@@ -52,31 +52,18 @@ func renderDocument(ctx context.Context, inPath, outPath string, opts map[string
 	if err != nil {
 		return err
 	}
-	workDir := filepath.Dir(outPath)
+	workDir, err := os.MkdirTemp(filepath.Dir(outPath), ".doc-render-")
+	if err != nil {
+		return fmt.Errorf("document render: mkdir workspace: %w", err)
+	}
+	defer os.RemoveAll(workDir)
 	pdfPath, err := exportDocumentPDF(ctx, inPath, workDir)
 	if err != nil {
 		return err
 	}
-	pages, err := rasterPDF(ctx, pdfPath, workDir, edge)
+	img, err := rasterSquare(ctx, pdfPath, workDir, edge)
 	if err != nil {
 		return err
-	}
-	if len(pages) == 0 {
-		return fmt.Errorf("document render: pdftoppm wrote no page")
-	}
-	var chosen image.Image
-	for _, page := range pages {
-		if pageIsBlank(page) {
-			continue
-		}
-		chosen = page
-		break
-	}
-	var img image.Image
-	if chosen == nil {
-		img = whiteSquare(edge)
-	} else {
-		img = letterboxPage(chosen, edge)
 	}
 	return writePNG(outPath, img)
 }
@@ -153,7 +140,7 @@ func exportDocumentPDF(ctx context.Context, inPath, workDir string) (string, err
 
 // pdftoppm pads the page number to the width of the page count, so ten pages are
 // page-01.png rather than page-1.png. -scale-to sets the longer side.
-func rasterPDF(ctx context.Context, pdfPath, workDir string, edge int) ([]image.Image, error) {
+func rasterSquare(ctx context.Context, pdfPath, workDir string, edge int) (image.Image, error) {
 	tmpDir := filepath.Join(workDir, "tmp")
 	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
 		return nil, fmt.Errorf("document render: mkdir engine tmp: %w", err)
@@ -163,7 +150,28 @@ func rasterPDF(ctx context.Context, pdfPath, workDir string, edge int) ([]image.
 	if err != nil {
 		return nil, fmt.Errorf("document render: %w", err)
 	}
-	return readRasterPages(workDir, base)
+	return squareFromPageFiles(workDir, base, edge)
+}
+
+func squareFromPageFiles(workDir, base string, edge int) (image.Image, error) {
+	paths, err := rasterPagePaths(workDir, base)
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("document render: pdftoppm wrote no page")
+	}
+	for _, path := range paths {
+		img, err := decodePage(path)
+		if err != nil {
+			return nil, err
+		}
+		if pageIsBlank(img) {
+			continue
+		}
+		return letterboxPage(img, edge), nil
+	}
+	return whiteSquare(edge), nil
 }
 
 func readRasterPages(workDir, base string) ([]image.Image, error) {
@@ -173,21 +181,29 @@ func readRasterPages(workDir, base string) ([]image.Image, error) {
 	}
 	pages := make([]image.Image, 0, len(paths))
 	for _, path := range paths {
-		f, err := os.Open(path)
+		img, err := decodePage(path)
 		if err != nil {
-			return nil, fmt.Errorf("document render: open page: %w", err)
-		}
-		img, decErr := png.Decode(f)
-		closeErr := f.Close()
-		if decErr != nil {
-			return nil, fmt.Errorf("document render: decode page: %w", decErr)
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("document render: close page: %w", closeErr)
+			return nil, err
 		}
 		pages = append(pages, img)
 	}
 	return pages, nil
+}
+
+func decodePage(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("document render: open page: %w", err)
+	}
+	img, decErr := png.Decode(f)
+	closeErr := f.Close()
+	if decErr != nil {
+		return nil, fmt.Errorf("document render: decode page: %w", decErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("document render: close page: %w", closeErr)
+	}
+	return img, nil
 }
 
 func rasterPagePaths(workDir, base string) ([]string, error) {

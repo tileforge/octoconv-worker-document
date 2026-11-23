@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -68,6 +69,48 @@ func TestDocumentRenderDocx(t *testing.T) {
 		img := decodePNG(t, pngBytes)
 		if img.Bounds().Dx() != 1280 || !pageIsBlank(img) {
 			t.Fatal("blank page")
+		}
+	})
+
+	t.Run("Workspace", func(t *testing.T) {
+		parent := t.TempDir()
+		writeMarkPNG(t, filepath.Join(parent, "page-02.png"), 9)
+		out := filepath.Join(parent, "out.png")
+		err := (DocumentRenderConverter{}).Convert(context.Background(), filepath.Join(parent, "in.docx"), out, nil)
+		if err == nil {
+			t.Fatal("missing engine")
+		}
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".doc-render-") {
+				t.Fatalf("workspace left %s", entry.Name())
+			}
+		}
+		if _, err := os.Stat(filepath.Join(parent, "page-02.png")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(out); !os.IsNotExist(err) {
+			t.Fatal("png left")
+		}
+	})
+
+	t.Run("FirstContent", func(t *testing.T) {
+		dir := t.TempDir()
+		base := filepath.Join(dir, "page")
+		writeWhitePNG(t, base+"-01.png")
+		writeMarkPNG(t, base+"-02.png", 40)
+		if err := os.WriteFile(base+"-03.png", []byte("not a png"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		img, err := squareFromPageFiles(dir, base, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pageIsBlank(img) || markOf(img) != 40 {
+			t.Fatalf("mark %d blank %v", markOf(img), pageIsBlank(img))
 		}
 	})
 
@@ -225,10 +268,22 @@ func cornersWhite(img image.Image) bool {
 	return true
 }
 
+func writeWhitePNG(t *testing.T, path string) {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.SetNRGBA(0, 0, color.NRGBA{R: 255, G: 255, B: 255, A: 255})
+	writeTestPNG(t, path, img)
+}
+
 func writeMarkPNG(t *testing.T, path string, mark byte) {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
 	img.SetNRGBA(0, 0, color.NRGBA{R: mark, A: 255})
+	writeTestPNG(t, path, img)
+}
+
+func writeTestPNG(t *testing.T, path string, img image.Image) {
+	t.Helper()
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
