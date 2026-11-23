@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -67,6 +68,42 @@ func TestDocumentRenderDocx(t *testing.T) {
 		img := decodePNG(t, pngBytes)
 		if img.Bounds().Dx() != 1280 || !pageIsBlank(img) {
 			t.Fatal("blank page")
+		}
+	})
+
+	t.Run("TenPages", func(t *testing.T) {
+		dir := t.TempDir()
+		base := filepath.Join(dir, "page")
+		for n := 1; n <= 10; n++ {
+			writeMarkPNG(t, fmt.Sprintf("%s-%02d.png", base, n), byte(n))
+		}
+		if err := os.WriteFile(filepath.Join(dir, "page.png"), []byte("no"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pages, err := readRasterPages(dir, base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pages) != 10 {
+			t.Fatalf("pages %d", len(pages))
+		}
+		for i, page := range pages {
+			if markOf(page) != byte(i+1) {
+				t.Fatalf("page %d mark %d", i+1, markOf(page))
+			}
+		}
+
+		mixed := t.TempDir()
+		mixedBase := filepath.Join(mixed, "page")
+		for _, n := range []int{1, 2, 10} {
+			writeMarkPNG(t, fmt.Sprintf("%s-%d.png", mixedBase, n), byte(n))
+		}
+		pages, err = readRasterPages(mixed, mixedBase)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pages) != 3 || markOf(pages[0]) != 1 || markOf(pages[1]) != 2 || markOf(pages[2]) != 10 {
+			t.Fatalf("mixed order %d", len(pages))
 		}
 	})
 
@@ -186,6 +223,26 @@ func cornersWhite(img image.Image) bool {
 		}
 	}
 	return true
+}
+
+func writeMarkPNG(t *testing.T, path string, mark byte) {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	img.SetNRGBA(0, 0, color.NRGBA{R: mark, A: 255})
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = png.Encode(f, img)
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		t.Fatal(err, closeErr)
+	}
+}
+
+func markOf(img image.Image) byte {
+	r, _, _, _ := img.At(img.Bounds().Min.X, img.Bounds().Min.Y).RGBA()
+	return byte(r >> 8)
 }
 
 func pixelWhite(c color.NRGBA) bool {

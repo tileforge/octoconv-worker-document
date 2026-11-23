@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -150,7 +151,8 @@ func exportDocumentPDF(ctx context.Context, inPath, workDir string) (string, err
 	return produced, nil
 }
 
-// pdftoppm names each page base-1.png, base-2.png, and so on. -scale-to sets the longer side.
+// pdftoppm pads the page number to the width of the page count, so ten pages are
+// page-01.png rather than page-1.png. -scale-to sets the longer side.
 func rasterPDF(ctx context.Context, pdfPath, workDir string, edge int) ([]image.Image, error) {
 	tmpDir := filepath.Join(workDir, "tmp")
 	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
@@ -161,14 +163,18 @@ func rasterPDF(ctx context.Context, pdfPath, workDir string, edge int) ([]image.
 	if err != nil {
 		return nil, fmt.Errorf("document render: %w", err)
 	}
-	var pages []image.Image
-	for n := 1; ; n++ {
-		path := fmt.Sprintf("%s-%d.png", base, n)
+	return readRasterPages(workDir, base)
+}
+
+func readRasterPages(workDir, base string) ([]image.Image, error) {
+	paths, err := rasterPagePaths(workDir, base)
+	if err != nil {
+		return nil, err
+	}
+	pages := make([]image.Image, 0, len(paths))
+	for _, path := range paths {
 		f, err := os.Open(path)
 		if err != nil {
-			if os.IsNotExist(err) {
-				break
-			}
 			return nil, fmt.Errorf("document render: open page: %w", err)
 		}
 		img, decErr := png.Decode(f)
@@ -182,6 +188,40 @@ func rasterPDF(ctx context.Context, pdfPath, workDir string, edge int) ([]image.
 		pages = append(pages, img)
 	}
 	return pages, nil
+}
+
+func rasterPagePaths(workDir, base string) ([]string, error) {
+	prefix := filepath.Base(base) + "-"
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return nil, fmt.Errorf("document render: read pages: %w", err)
+	}
+	type pageFile struct {
+		n    int
+		path string
+	}
+	found := make([]pageFile, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".png") {
+			continue
+		}
+		numText := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".png")
+		n, err := strconv.Atoi(numText)
+		if err != nil || n < 1 {
+			continue
+		}
+		found = append(found, pageFile{n: n, path: filepath.Join(workDir, name)})
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].n < found[j].n })
+	paths := make([]string, len(found))
+	for i, page := range found {
+		paths[i] = page.path
+	}
+	return paths, nil
 }
 
 func pageIsBlank(img image.Image) bool {
