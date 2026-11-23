@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -157,9 +158,17 @@ func TestManifestOperation(t *testing.T) {
 	if err != nil || got != convert.OperationConvert {
 		t.Fatalf("operation %q %v", got, err)
 	}
+	renderRaw, err := os.ReadFile(filepath.Join("..", "..", "schema", "manifest-document-render.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = manifestOperation(renderRaw)
+	if err != nil || got != convert.OperationRender {
+		t.Fatalf("render operation %q %v", got, err)
+	}
 	for _, body := range []string{
 		`{"capabilities":[{"legacy":{"operation":"convert","engine":"cad"}}]}`,
-		`{"capabilities":[{"legacy":{"operation":"render","engine":"document"}}]}`,
+		`{"capabilities":[{"legacy":{"operation":"render","engine":"cad"}}]}`,
 		`{"capabilities":[{"legacy":{"operation":"convert","engine":"document"}},{"legacy":{"operation":"convert","engine":"document"}}]}`,
 	} {
 		if _, err := manifestOperation([]byte(body)); err == nil {
@@ -231,6 +240,149 @@ func TestAssignmentOutputs(t *testing.T) {
 	if _, ok = assignmentOutputs([]fileLinkJSON{{Role: "primary", Ordinal: 1, Href: "https://files/primary", Format: "pdf"}}); ok {
 		t.Fatal("ordinal accepted")
 	}
+}
+
+func TestDocumentRenderAssignment(t *testing.T) {
+	t.Run("Unserved", func(t *testing.T) {
+		fails, puts := runRenderAssignment(t, []byte("%PDF-1.4"), "pdf", "png")
+		if fails != 1 || len(puts) != 0 {
+			t.Fatalf("fails %d puts %d", fails, len(puts))
+		}
+	})
+	t.Run("Undrawable", func(t *testing.T) {
+		fails, puts := runRenderAssignment(t, []byte("not a docx"), "docx", "png")
+		if fails != 1 || len(puts) != 0 {
+			t.Fatalf("fails %d puts %d", fails, len(puts))
+		}
+	})
+	t.Run("Content", func(t *testing.T) {
+		src := docxBytes("X")
+		dir := t.TempDir()
+		in := filepath.Join(dir, "in.docx")
+		out := filepath.Join(dir, "out.png")
+		if err := os.WriteFile(in, src, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := (convert.DocumentRenderConverter{}).Convert(context.Background(), in, out, nil); err != nil {
+			t.Skip("render engines are not available")
+		}
+		want, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fails, puts := runRenderAssignment(t, src, "docx", "png")
+		if fails != 0 || len(puts) != 1 {
+			t.Fatalf("fails %d puts %d", fails, len(puts))
+		}
+		for _, put := range puts {
+			if !bytes.Equal(put.body, want) || put.contentType != "image/png" {
+				t.Fatalf("put %d %s", len(put.body), put.contentType)
+			}
+		}
+	})
+	t.Run("AllBlank", func(t *testing.T) {
+		src := docxBytes("")
+		dir := t.TempDir()
+		in := filepath.Join(dir, "in.docx")
+		out := filepath.Join(dir, "out.png")
+		if err := os.WriteFile(in, src, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := (convert.DocumentRenderConverter{}).Convert(context.Background(), in, out, nil); err != nil {
+			t.Skip("render engines are not available")
+		}
+		want, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fails, puts := runRenderAssignment(t, src, "docx", "png")
+		if fails != 0 || len(puts) != 1 {
+			t.Fatalf("fails %d puts %d", fails, len(puts))
+		}
+		for _, put := range puts {
+			if !bytes.Equal(put.body, want) {
+				t.Fatal("blank put")
+			}
+		}
+	})
+}
+
+func runRenderAssignment(t *testing.T, src []byte, from, to string) (int, map[string]putBody) {
+	t.Helper()
+	var mu sync.Mutex
+	fails := 0
+	puts := map[string]putBody{}
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_, _ = w.Write(src)
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			mu.Lock()
+			puts[r.URL.Path] = putBody{body: body, contentType: r.Header.Get("Content-Type")}
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			if strings.Contains(r.URL.Path, "/fail") {
+				mu.Lock()
+				fails++
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}), nil)
+	c.fileHTTP = c.coreHTTP
+	c.operation = convert.OperationRender
+	c.engineLimit = time.Minute
+	c.leaseSeconds = 30
+	c.sessionToken = "token"
+	href := c.core.String() + "/objects/render"
+	asgn := assignmentJSON{
+		AttemptID:       "render-" + from,
+		AttemptToken:    "attempt-token",
+		AttemptDeadline: time.Now().Add(30 * time.Minute).Format(time.RFC3339Nano),
+		LeaseExpiresAt:  time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		Limits:          limitsJSON{MaxOutputBytes: convert.MaxFileBytes},
+		Inputs:          []fileLinkJSON{{Role: "source", Ordinal: 0, Href: href, Format: from}},
+		Outputs:         []fileLinkJSON{{Role: "primary", Ordinal: 0, Href: href, Format: to}},
+	}
+	if err := c.runAssignment(context.Background(), asgn, controlJSON{}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return fails, puts
+}
+
+func docxBytes(text string) []byte {
+	body := `<w:p><w:r><w:t>` + text + `</w:t></w:r></w:p>`
+	if text == "" {
+		body = `<w:p/>`
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	files := map[string]string{
+		"[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`,
+		"_rels/.rels":         `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`,
+		"word/document.xml":   `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` + body + `</w:body></w:document>`,
+	}
+	for name, contents := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			panic(err)
+		}
+		if _, err := w.Write([]byte(contents)); err != nil {
+			panic(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
 }
 
 func TestDocumentEngineCode(t *testing.T) {

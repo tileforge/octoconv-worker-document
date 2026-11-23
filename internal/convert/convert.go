@@ -10,6 +10,7 @@ import (
 const (
 	EngineDocument       = "document"
 	OperationConvert     = "convert"
+	OperationRender      = "render"
 	DefaultEngineTimeout = 300 * time.Second
 	MaxFileBytes         = 100 << 20
 )
@@ -31,6 +32,8 @@ func MIMEType(format string) string {
 	switch NormalizeFormat(format) {
 	case "pdf":
 		return "application/pdf"
+	case "png":
+		return "image/png"
 	case "docx":
 		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	case "xlsx":
@@ -69,11 +72,24 @@ func NewRegistry() *Registry {
 	return &Registry{m: make(map[opKey]Converter)}
 }
 
+// operationalConverter is implemented by a converter whose pairs are not convert.
+type operationalConverter interface {
+	Operation() string
+}
+
+func operationOf(c Converter) string {
+	if oc, ok := c.(operationalConverter); ok {
+		return oc.Operation()
+	}
+	return OperationConvert
+}
+
 // Register indexes each pair c reports.
 func (r *Registry) Register(c Converter) {
+	op := operationOf(c)
 	for _, pair := range c.Pairs() {
 		r.m[opKey{
-			Operation: OperationConvert,
+			Operation: op,
 			From:      NormalizeFormat(pair.From),
 			To:        NormalizeFormat(pair.To),
 		}] = c

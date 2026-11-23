@@ -93,7 +93,10 @@ func manifestOperation(manifest []byte) (string, error) {
 		return "", errors.New("document protocol manifest")
 	}
 	legacy := doc.Capabilities[0].Legacy
-	if legacy.Engine != convert.EngineDocument || legacy.Operation != convert.OperationConvert {
+	if legacy.Engine != convert.EngineDocument {
+		return "", errors.New("document protocol manifest")
+	}
+	if legacy.Operation != convert.OperationConvert && legacy.Operation != convert.OperationRender {
 		return "", errors.New("document protocol manifest")
 	}
 	return legacy.Operation, nil
